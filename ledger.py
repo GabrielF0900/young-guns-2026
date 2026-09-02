@@ -8,9 +8,10 @@ import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
 
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS applied_events (
-    event_id     TEXT    NOT NULL,
+    event_id     TEXT    PRIMARY KEY,
     account_id   TEXT    NOT NULL,
     amount_cents INTEGER NOT NULL
 );
@@ -37,13 +38,17 @@ class CreditResult:
 class CreditLedger:
     def __init__(self, database_path: str):
         self._database_path = database_path
-        self._processed_event_ids: set[str] = set()
+
         with self._transaction() as conn:
             conn.executescript(SCHEMA)
 
     @contextmanager
     def _transaction(self):
-        conn = sqlite3.connect(self._database_path, timeout=DATABASE_TIMEOUT_SECONDS)
+        conn = sqlite3.connect(
+            self._database_path,
+            timeout=DATABASE_TIMEOUT_SECONDS,
+        )
+
         try:
             with conn:
                 yield conn
@@ -56,34 +61,55 @@ class CreditLedger:
         account_id: str,
         amount_cents: int,
     ) -> CreditResult:
-        if event_id in self._processed_event_ids:
-            return CreditResult(applied=False, balance_cents=self.balance(account_id))
+        if not event_id:
+            raise InvalidCreditError("event_id must not be empty")
+
+        if not account_id:
+            raise InvalidCreditError("account_id must not be empty")
+
+        if amount_cents <= 0:
+            raise InvalidCreditError("amount_cents must be greater than zero")
 
         with self._transaction() as conn:
-            conn.execute(
-                "INSERT INTO applied_events (event_id, account_id, amount_cents)"
-                " VALUES (?, ?, ?)",
+            cursor = conn.execute(
+                "INSERT OR IGNORE INTO applied_events "
+                "(event_id, account_id, amount_cents) "
+                "VALUES (?, ?, ?)",
                 (event_id, account_id, amount_cents),
             )
-            conn.execute(
-                "INSERT OR IGNORE INTO accounts (account_id, balance_cents)"
-                " VALUES (?, 0)",
+
+            applied = cursor.rowcount == 1
+
+            if applied:
+                conn.execute(
+                    "INSERT OR IGNORE INTO accounts "
+                    "(account_id, balance_cents) "
+                    "VALUES (?, 0)",
+                    (account_id,),
+                )
+
+                conn.execute(
+                    "UPDATE accounts "
+                    "SET balance_cents = balance_cents + ? "
+                    "WHERE account_id = ?",
+                    (amount_cents, account_id),
+                )
+
+            row = conn.execute(
+                "SELECT balance_cents "
+                "FROM accounts "
+                "WHERE account_id = ?",
                 (account_id,),
-            )
-            conn.execute(
-                "UPDATE accounts SET balance_cents = balance_cents + ?"
-                " WHERE account_id = ?",
-                (amount_cents, account_id),
-            )
+            ).fetchone()
 
-        self._processed_event_ids.add(event_id)
-
-        return CreditResult(applied=True, balance_cents=self.balance(account_id))
+        return CreditResult(applied=applied, balance_cents=row[0] if row else 0)
 
     def balance(self, account_id: str) -> int:
         with self._transaction() as conn:
             row = conn.execute(
-                "SELECT balance_cents FROM accounts WHERE account_id = ?",
+                "SELECT balance_cents "
+                "FROM accounts "
+                "WHERE account_id = ?",
                 (account_id,),
             ).fetchone()
 
