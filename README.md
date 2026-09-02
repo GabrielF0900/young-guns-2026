@@ -1,128 +1,98 @@
-# Desafio Young Gun — Aplicar crédito sem duplicar
+# Pipefy Young Guns — Credit Ledger Idempotency Challenge
 
-Este repositório faz parte do processo seletivo. Você vai trabalhar em um serviço Python que **aplica créditos em contas** a partir de eventos enviados por um provedor de pagamentos.
+Solução para aplicação idempotente de créditos com Python e SQLite, cobrindo restart, concorrência, múltiplas instâncias e validação de entrada.
 
-**Pode usar AI** (ChatGPT, Copilot, Cursor, etc.). O que importa é você entender o que mudou, conseguir explicar no vídeo e entregar um PR organizado.
+## Resumo da solução
 
-Tempo estimado: **2 a 3 horas**.
+O código original mantinha em memória os IDs dos eventos processados. Esse controle era perdido após um restart e não era compartilhado entre instâncias concorrentes.
 
-## O contexto
+A solução usa o SQLite como fonte de verdade: `event_id` é a `PRIMARY KEY` de `applied_events`, e `INSERT OR IGNORE` resolve atomicamente a disputa por um evento. O valor de `cursor.rowcount` informa se esta chamada inseriu o registro; a conta só é criada ou atualizada quando isso acontece. O registro do evento e o crédito ficam na mesma transação, depois da validação da entrada.
 
-O provedor externo envia eventos assim:
+## Problemas corrigidos
 
-```
-event_id = "evt-abc123"   # identificador estável do evento
-account_id = "acc-42"     # conta que recebe o crédito
-amount_cents = 1000       # R$ 10 em centavos
-```
+| Problema | Correção |
+|----------|----------|
+| Estado de idempotência apenas em memória | O histórico passou para `applied_events` no SQLite. |
+| Perda do histórico no restart | Eventos persistem no arquivo do banco. |
+| Múltiplas instâncias com memória separada | Todas consultam a mesma restrição persistente. |
+| Ausência de unicidade de `event_id` | `event_id` tornou-se `PRIMARY KEY`. |
+| Race condition de *check-then-act* | `INSERT OR IGNORE` combina tentativa e decisão no banco. |
+| Decisão idempotente fora do banco | `cursor.rowcount` identifica o vencedor da inserção. |
+| Inputs inválidos | `InvalidCreditError` é lançado antes de qualquer mutação. |
+| `applied` não refletia o resultado persistente | O retorno agora deriva do resultado real do `INSERT`. |
 
-O provedor garante que o `event_id` é estável, mas **não** garante entrega única. O mesmo evento pode chegar:
+## Como funciona
 
-- duas vezes seguidas (retry depois de um timeout)
-- depois que o serviço reiniciou (redeploy, crash)
-- **duas vezes ao mesmo tempo**, em threads diferentes
+O fluxo de `CreditLedger.apply_credit` é:
 
-Em nenhum desses casos o cliente pode receber o crédito em dobro. Dinheiro a mais na conta errada é um incidente, não um detalhe.
+1. Valida `event_id`, `account_id` e `amount_cents`.
+2. Abre uma transação no SQLite.
+3. Tenta registrar o `event_id` com `INSERT OR IGNORE`.
+4. O SQLite aplica a unicidade definida pela `PRIMARY KEY`.
+5. Verifica `cursor.rowcount` para saber se esta chamada inseriu o evento.
+6. Somente o vencedor cria a conta, se necessário, e atualiza o saldo.
+7. Chamadas duplicadas não alteram o saldo.
+8. Retorna `CreditResult` com `applied` e `balance_cents` correspondentes ao estado persistido.
 
-O saldo fica em um arquivo SQLite (`ledger.db`). O módulo `sqlite3` já vem com o Python — não é preciso instalar nem subir nenhum servidor.
+A concorrência funciona porque a restrição de unicidade está no SQLite compartilhado: threads e instâncias diferentes disputam a mesma fonte persistente de verdade.
 
-```bash
-python cli.py evt-abc123 acc-42 1000
-```
+## Comportamentos atendidos
 
-Saída:
+- [x] Mesmo `event_id` aplicado uma única vez
+- [x] Idempotência após restart
+- [x] Concorrência entre threads
+- [x] Duas instâncias utilizando o mesmo banco
+- [x] Validação de inputs inválidos
+- [x] Reutilização de `event_id` após tentativa inválida
+- [x] Eventos diferentes continuam acumulando
+- [x] Testes isolados por arquivo SQLite
 
-```
-Evento evt-abc123: aplicado
-Saldo de acc-42: 1000 centavos
-```
+## Testes
 
-## Comportamento esperado
+Além dos testes básicos e do teste de restart `test_duplicate_event_is_ignored_after_restart`, foram adicionados:
 
-Leia com atenção — o código atual **não** cumpre tudo isso.
+- `test_concurrent_duplicate_event_is_applied_only_once`
+- `test_concurrent_duplicate_event_across_instances_is_applied_once`
+- `test_invalid_credit_has_no_effect`
+- `test_event_id_can_be_reused_after_invalid_credit`
+- `test_different_events_accumulate_when_applied_concurrently`
 
-1. **Idempotência.** Aplicar o mesmo `event_id` de novo devolve `applied=False` e deixa o saldo como está.
-2. **Idempotência no restart.** Se o processo cair e subir de novo, um `event_id` já aplicado ainda é tratado como duplicado.
-3. **Concorrência.** Se o mesmo `event_id` chegar em duas ou mais threads ao mesmo tempo, o crédito é aplicado **uma única vez**.
-4. **Várias instâncias, mesmo banco.** Em produção o serviço roda em mais de um worker usando o **mesmo** `ledger.db`. Duas instâncias de `CreditLedger` apontando para o mesmo arquivo, recebendo o mesmo evento ao mesmo tempo, também creditam **uma única vez**.
-5. **Validação de input.** Evento inválido levanta `InvalidCreditError` (já definida em `ledger.py`), **não** muda o saldo e **não** grava o evento. Um `event_id` recusado ainda pode ser usado depois, num evento válido. São inválidos: `event_id` ou `account_id` vazios, e `amount_cents` menor ou igual a zero.
-6. **Eventos diferentes somam.** A correção não pode bloquear demais: dois `event_id` distintos, mesmo em paralelo, geram dois créditos.
-7. **Testes isolados.** Cada teste usa o próprio arquivo de banco — a fixture `database_path` já faz isso.
+Os testes concorrentes usam `threading.Barrier` para sincronizar o início das chamadas e aumentar a chance real de colisão. Nos cenários de evento duplicado, verificam que exatamente uma chamada retorna `applied=True`, as demais retornam `False` e o saldo final contém um único crédito.
 
-Você pode mudar o schema do banco. Se mudar, apague o `ledger.db` local antes de rodar o CLI de novo.
+Cada teste recebe um arquivo SQLite temporário e isolado por meio da fixture `database_path`.
 
-### Duas restrições importantes
+## Como executar
 
-**Não mude o jeito de chamar o código.** Você pode reescrever o que quiser por dentro, mas estas funções e atributos precisam continuar funcionando:
+Requisito: Python 3.11 ou superior.
 
-```python
-ledger = CreditLedger(database_path)              # caminho do arquivo SQLite
-result = ledger.apply_credit(event_id, account_id, amount_cents)
-result.applied        # bool
-result.balance_cents  # int
-ledger.balance(account_id)                        # int
-InvalidCreditError                                # exceção de validação
-```
+No PowerShell:
 
-**Vamos rodar testes que você não vê.** Além dos testes deste repositório, sua solução passa por testes extras que chamam as funções acima e checam os 7 itens de comportamento esperado. Não escreva código só para o teste vermelho — cubra o que está descrito aqui.
-
-## O que você precisa entregar
-
-Repositório: https://github.com/pipe-challenge/young-guns-2026
-
-1. **Fazer um fork** deste repositório (botão *Fork* no GitHub) e **clonar o seu fork**
-2. **Criar uma branch** a partir de `main` — use o padrão `fix/<seu-primeiro-nome>`
-3. **Corrigir o código** para cumprir o comportamento esperado
-4. **Fazer os testes existentes passarem** — não apague nem altere as asserções dos testes que já estão no repositório; você pode **adicionar** testes novos
-5. **Escrever pelo menos 2 testes novos**, sendo que um deles precisa cobrir **concorrência** (item 3 acima). O módulo `threading` já vem com o Python.
-6. **Fazer commits** claros (vários commits pequenos > um commit gigante "fix all")
-7. **Abrir um Pull Request** do seu fork para `pipe-challenge/young-guns-2026`, branch `main`
-8. **Gravar um vídeo curto** (3 a 5 minutos) e **colar o link na descrição do PR**
-
-Não envie o arquivo de vídeo no GitHub. Use Loom, YouTube (não listado) ou Google Drive com acesso liberado.
-
-### Dica importante sobre o teste de concorrência
-
-Esse teste só vale se ele **falha no código original**. Antes de corrigir, escreva o teste e veja ele falhar — depois corrija e veja passar. Se o teste passa nos dois casos, ele não está testando nada.
-
-Mostrar esses dois momentos no vídeo conta muito a seu favor.
-
-### O que o vídeo precisa cobrir
-
-- Quais problemas você encontrou e **como** encontrou
-- Por que a sua correção funciona (principalmente a de concorrência)
-- Como você provou que funciona
-- Se usou AI: o que ela sugeriu, o que você aceitou e o que você descartou
-- Uma coisa que você faria diferente com mais tempo
-
-## Setup
-
-Python **3.11+**. Sem dependências externas além do pytest.
-
-```bash
-git clone https://github.com/<seu-usuario>/young-guns-2026.git
-cd young-guns-2026
-git checkout -b fix/<seu-primeiro-nome>
-
+```powershell
 python -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-pytest
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+python -m pytest
 ```
 
-No estado atual do repositório, `pytest` **não passa**. Isso é proposital.
+No Prompt de Comando (`cmd`):
 
-## Regras
+```bat
+python -m venv .venv
+.venv\Scripts\activate.bat
+python -m pip install -r requirements.txt
+python -m pytest
+```
 
-- Pode usar AI. Conte no PR quais ferramentas usou e no que elas ajudaram.
-- Não altere as asserções dos testes existentes.
-- Não adicione dependências novas sem justificar no PR.
-- Mantenha a solução simples. Não estamos pedindo para reorganizar o projeto.
-- Commits em português ou inglês, desde que descrevam **por quê**, não só "fix".
-- O PR precisa do link do vídeo para ser considerado completo.
+O workflow de CI em `.github/workflows/ci.yml` também instala as dependências e executa `pytest` com Python 3.12 em pull requests e pushes para `main`.
 
-## O que vamos avaliar
+## Uso de IA
 
-O detalhe está em [`AVALIACAO.md`](AVALIACAO.md). Em resumo: o teste vermelho é o começo, não o fim; os testes novos precisam falhar no código original; e o vídeo precisa mostrar que você entendeu a correção — inclusive se usou AI.
+Usei o Codex como apoio para revisar a implementação e os testes e para organizar esta documentação. As sugestões aceitas foram confrontadas com o código e com os requisitos do desafio. Evitei adicionar mecanismos não implementados, dependências ou refatorações fora do escopo; a decisão de idempotência permanece simples e centralizada no SQLite.
 
-Boa sorte.
+## Limitação reconhecida
+
+A solução depende de todas as instâncias acessarem o mesmo arquivo SQLite. Ela atende ao cenário proposto, inclusive com múltiplas instâncias no mesmo banco, mas não é uma arquitetura para execução distribuída em máquinas sem um arquivo compartilhado. Além disso, contenção prolongada de escrita pode exceder o timeout configurado de 5 segundos.
+
+## Vídeo técnico
+
+[Assista à apresentação técnica no YouTube](https://youtu.be/_NOs10y3AVE).
